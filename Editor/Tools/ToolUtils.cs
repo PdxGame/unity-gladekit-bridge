@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
+using System.Security.Cryptography;
 using System.Text;
 using UnityEngine;
 using UnityEngine.SceneManagement;
@@ -984,6 +986,236 @@ namespace GladeAgenticAI.Core.Tools
             return false;
         }
 
+        // ----- Argument extraction helpers -----
+        // These replace the ~200 hand-rolled `args.ContainsKey(k) ? args[k]?.ToString() : ""`
+        // patterns scattered across tool implementations. Centralizing here makes
+        // numeric coercion consistent: AI providers send ints as int, floats as
+        // float, but JSON round-trips can convert numbers to string.
+
+        /// <summary>True when args has the key with a non-null value.</summary>
+        public static bool HasArg(Dictionary<string, object> args, string key)
+        {
+            return args != null && args.ContainsKey(key) && args[key] != null;
+        }
+
+        /// <summary>Extracts a string arg. Returns default when missing or null.</summary>
+        public static string GetStringArg(Dictionary<string, object> args, string key, string defaultValue = "")
+        {
+            if (!HasArg(args, key)) return defaultValue;
+            return args[key].ToString();
+        }
+
+        /// <summary>
+        /// Extracts an int arg, coercing from int, long, float, double, or string.
+        /// Returns default when missing or unparseable.
+        /// </summary>
+        public static int GetIntArg(Dictionary<string, object> args, string key, int defaultValue = 0)
+        {
+            if (!HasArg(args, key)) return defaultValue;
+            object v = args[key];
+            if (v is int i) return i;
+            if (v is long l) return (int)l;
+            if (v is float f) return (int)f;
+            if (v is double d) return (int)d;
+            if (int.TryParse(v.ToString(), System.Globalization.NumberStyles.Integer, System.Globalization.CultureInfo.InvariantCulture, out int parsed))
+                return parsed;
+            if (float.TryParse(v.ToString(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float fp))
+                return (int)fp;
+            return defaultValue;
+        }
+
+        /// <summary>
+        /// Extracts a float arg, coercing from int, long, float, double, or string.
+        /// Returns default when missing or unparseable.
+        /// </summary>
+        public static float GetFloatArg(Dictionary<string, object> args, string key, float defaultValue = 0f)
+        {
+            if (!HasArg(args, key)) return defaultValue;
+            object v = args[key];
+            if (v is float f) return f;
+            if (v is double d) return (float)d;
+            if (v is int i) return i;
+            if (v is long l) return l;
+            if (float.TryParse(v.ToString(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float parsed))
+                return parsed;
+            return defaultValue;
+        }
+
+        /// <summary>
+        /// Extracts a bool arg with the same coercion rules as ParseBool.
+        /// Returns default when missing.
+        /// </summary>
+        public static bool GetBoolArg(Dictionary<string, object> args, string key, bool defaultValue = false)
+        {
+            if (!HasArg(args, key)) return defaultValue;
+            object v = args[key];
+            if (v is bool b) return b;
+            if (bool.TryParse(v.ToString(), out bool parsed)) return parsed;
+            return defaultValue;
+        }
+
+        /// <summary>
+        /// Resolves a bundled tool template file (e.g. "ThirdPersonController.cs.txt") to a
+        /// readable path, working across BOTH bridge install layouts:
+        ///   - UPM / dev bridge:   Packages/com.gladekit.mcp-bridge/Editor/Tools/Templates/
+        ///   - Desktop DLL bridge: Packages/com.gladekit.agenticai/Editor/Tools/Templates/
+        ///                         (and the legacy in-Assets location)
+        /// Falls back to an AssetDatabase name search so a layout change does not silently
+        /// break template tools. Returns null if no candidate exists.
+        ///
+        /// Templates are stored as .cs.txt (not .cs) so they are NOT compiled into the bridge
+        /// assembly — only the copy written into the user's project compiles.
+        /// </summary>
+        public static string ResolveTemplatePath(string fileName)
+        {
+            if (string.IsNullOrEmpty(fileName)) return null;
+
+            var candidates = new[]
+            {
+                "Packages/com.gladekit.mcp-bridge/Editor/Tools/Templates/" + fileName,
+                "Packages/com.gladekit.agenticai/Editor/Tools/Templates/" + fileName,
+                "Assets/Editor/GladeAgenticAI/Tools/Templates/" + fileName,
+            };
+            foreach (var c in candidates)
+            {
+                if (File.Exists(c)) return c;
+            }
+
+            // Last resort: search the AssetDatabase by leaf name. FindAssets does not index
+            // by extension, so match on the full leaf under any /Templates/ folder.
+            string leaf = Path.GetFileName(fileName);
+            string searchName = leaf;
+            int dot = searchName.IndexOf('.');
+            if (dot > 0) searchName = searchName.Substring(0, dot);
+            foreach (var guid in AssetDatabase.FindAssets(searchName))
+            {
+                string path = AssetDatabase.GUIDToAssetPath(guid);
+                if (!string.IsNullOrEmpty(path)
+                    && path.Replace('\\', '/').EndsWith("/Templates/" + leaf, StringComparison.OrdinalIgnoreCase)
+                    && File.Exists(path))
+                {
+                    return path;
+                }
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// Validates that all required keys exist in args with non-null, non-empty-string values.
+        /// Returns null if all present; otherwise returns a ready-to-return CreateErrorResponse JSON.
+        /// Usage:  var err = ToolUtils.ValidateRequiredArgs(args, "gameObjectPath", "componentType");
+        ///         if (err != null) return err;
+        /// </summary>
+        public static string ValidateRequiredArgs(Dictionary<string, object> args, params string[] keys)
+        {
+            foreach (var key in keys)
+            {
+                if (!HasArg(args, key))
+                    return CreateErrorResponse($"{key} is required");
+                if (args[key] is string s && string.IsNullOrEmpty(s))
+                    return CreateErrorResponse($"{key} is required");
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// Records an undo step, marks the asset dirty, and saves the asset database.
+        /// Use after mutating any asset (Material, ScriptableObject, AnimatorController, etc.).
+        /// Centralizing this trio prevents the "forgot SaveAssets" bug that silently
+        /// drops changes when Unity closes without an explicit save.
+        /// </summary>
+        public static void RecordAndSaveAsset(UnityEngine.Object asset, string undoLabel)
+        {
+            if (asset == null) return;
+            if (!string.IsNullOrEmpty(undoLabel))
+                Undo.RecordObject(asset, undoLabel);
+            EditorUtility.SetDirty(asset);
+            AssetDatabase.SaveAssets();
+        }
+
+        /// <summary>
+        /// True if a tool-supplied asset path does not escape the project via
+        /// directory traversal. A bare <c>StartsWith("Assets/")</c> check is
+        /// not enough: "Assets/../../evil.cs" passes the prefix test yet writes
+        /// outside the project root. We reject any path segment that is exactly
+        /// ".." (after normalizing both slash styles), which catches traversal
+        /// while leaving legitimate filenames that merely contain dots
+        /// (e.g. "Assets/My..Folder/file.cs", "Assets/v1.2.3/data.asset") alone.
+        /// Null/empty is treated as safe here — required-ness is enforced by the
+        /// individual tools' own argument validation.
+        /// </summary>
+        public static bool IsAssetPathSafe(string path)
+        {
+            if (string.IsNullOrEmpty(path)) return true;
+            string[] segments = path.Replace('\\', '/').Split('/');
+            foreach (string segment in segments)
+            {
+                if (segment == "..") return false;
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// Absolute path to the Unity project root — the parent of the "Assets"
+        /// folder (Application.dataPath is "&lt;project&gt;/Assets"). Unity's process
+        /// working directory equals this at runtime.
+        /// </summary>
+        public static string GetProjectRoot()
+        {
+            return Path.GetDirectoryName(Application.dataPath.Replace('\\', '/'));
+        }
+
+        /// <summary>
+        /// True only when <paramref name="path"/> resolves to a location INSIDE the
+        /// project root. Unlike <see cref="IsAssetPathSafe"/> — which only rejects
+        /// literal ".." segments — this also rejects ABSOLUTE paths that escape the
+        /// project (e.g. "/etc/passwd", "C:\\Windows\\..."), so it is the correct
+        /// guard for the raw File.Copy / File.Delete endpoints that act on
+        /// wire-supplied paths. A relative path is resolved against Unity's working
+        /// directory, which is the project root; ".." is collapsed by GetFullPath.
+        /// </summary>
+        public static bool IsPathInsideProject(string path)
+        {
+            return IsPathInsideRoot(path, GetProjectRoot());
+        }
+
+        /// <summary>
+        /// Testable core of <see cref="IsPathInsideProject"/> with the root injected.
+        /// A relative <paramref name="path"/> is resolved against
+        /// <paramref name="projectRoot"/> (not the process CWD), and an absolute path
+        /// is taken as-is; either way ".." is collapsed before the containment check.
+        /// A sibling like "/proj-evil" is rejected against root "/proj" by the
+        /// separator boundary, so a prefix match alone never passes.
+        /// </summary>
+        public static bool IsPathInsideRoot(string path, string projectRoot)
+        {
+            if (string.IsNullOrWhiteSpace(path) || string.IsNullOrWhiteSpace(projectRoot))
+                return false;
+            try
+            {
+                string root = Path.GetFullPath(projectRoot).TrimEnd('/', '\\');
+                string full = Path.GetFullPath(path, root);
+                if (full.Equals(root, System.StringComparison.OrdinalIgnoreCase))
+                    return true;
+                return full.StartsWith(root + Path.DirectorySeparatorChar, System.StringComparison.OrdinalIgnoreCase)
+                    || full.StartsWith(root + Path.AltDirectorySeparatorChar, System.StringComparison.OrdinalIgnoreCase);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Convenience overload of NormalizeAssetPath that returns just the resolved path
+        /// without the actualPath out-param. Use when callers don't need to differentiate
+        /// "exact match" from "case-corrected match".
+        /// </summary>
+        public static string NormalizeAssetPath(string assetPath)
+        {
+            return NormalizeAssetPath(assetPath, out _);
+        }
+
         public static int ParseLayerMask(object value)
         {
             if (value == null) return ~0;
@@ -1458,6 +1690,48 @@ namespace GladeAgenticAI.Core.Tools
                     return $"\"{EscapeJsonString(prop.enumNames[prop.enumValueIndex])}\"";
                 default:
                     return $"\"{EscapeJsonString(prop.displayName)}\"";
+            }
+        }
+
+        /// <summary>
+        /// SHA-256 hex digest of an Assets-rooted file's UTF-8 text. Used by
+        /// the apply path to detect drift between "what the client read via
+        /// get_script_content" and "what's on disk at apply time" — if the
+        /// user edited the file in their IDE between the proposal arriving and
+        /// clicking Apply, we want to surface that rather than silently
+        /// overwriting their edits.
+        ///
+        /// Hashes the text contents (not raw bytes) so the result matches a
+        /// hash the client computes over the same string returned by
+        /// GetScriptContent. Returns null if the file does not exist or cannot
+        /// be read — callers treat null as "skip the check for this path" (the
+        /// client passes an expected hash only when it actually captured one
+        /// from a prior get_script_content).
+        /// </summary>
+        public static string ComputeFileSha256(string assetPath)
+        {
+            if (string.IsNullOrEmpty(assetPath)) return null;
+            try
+            {
+                string text = File.ReadAllText(assetPath, Encoding.UTF8);
+                using (var sha = SHA256.Create())
+                {
+                    byte[] bytes = Encoding.UTF8.GetBytes(text);
+                    byte[] hash = sha.ComputeHash(bytes);
+                    return BitConverter.ToString(hash).Replace("-", "").ToLowerInvariant();
+                }
+            }
+            catch (FileNotFoundException)
+            {
+                return null;
+            }
+            catch (DirectoryNotFoundException)
+            {
+                return null;
+            }
+            catch (Exception)
+            {
+                return null;
             }
         }
     }

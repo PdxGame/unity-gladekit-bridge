@@ -36,14 +36,21 @@ namespace GladeAgenticAI.Services
 
         private static readonly object _lock = new object();
         private static readonly List<MutationRecord> _timeline = new List<MutationRecord>();
+        // Scripts written this session by tools OTHER than create_script (e.g.
+        // template tools like create_third_person_controller). Lets the
+        // create_script / modify_script overwrite guards treat template-written
+        // files as session-created so the agent can iterate on them without
+        // tripping the "pre-existing user code" refusal.
+        private static readonly HashSet<string> _scriptsCreatedThisSession =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
         private static readonly DateTime _sessionStart = DateTime.UtcNow;
         private static int _totalToolCalls;
         private static int _successCount;
         private static int _errorCount;
 
-        // Read-only tool names — skip from the mutation log. Source of truth
-        // is Python-side READ_ONLY_TOOLS, duplicated here to keep the bridge
-        // self-contained (no HTTP dependency for classification).
+        // Read-only tool names — skip from the mutation log. Kept in the
+        // bridge so classification needs no round-trip to the client; must
+        // match the client's read-only tool list.
         private static readonly HashSet<string> ReadOnlyTools = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {
             "think", "request_user_input",
@@ -57,7 +64,7 @@ namespace GladeAgenticAI.Services
             "get_animator_state_info", "get_animator_transition_info", "get_blend_tree_info",
             "get_ik_target_info", "get_ik_weight", "get_sprite_animation_info",
             "get_unity_console_logs", "get_render_settings", "get_rigidbody_properties",
-            "get_collider_properties", "get_character_controller_properties",
+            "get_collider_properties", "get_character_controller_properties", "get_tilemap_info",
             "get_collision_matrix", "get_input_system_info", "get_texture_import_settings",
             "get_model_import_settings", "get_audio_import_settings", "get_sprite_import_settings",
             "raycast", "raycast_all", "linecast", "overlap_sphere", "overlap_box",
@@ -203,6 +210,66 @@ namespace GladeAgenticAI.Services
         }
 
         /// <summary>
+        /// Was this script path created by a successful create_script call
+        /// earlier in the current Unity session? Used by ModifyScriptTool
+        /// as a session-aware safety check that gates modify_script against
+        /// pre-existing project scripts — protects user code against AI
+        /// clients that misread "scaffold a new system" prompts as
+        /// "extend an existing one" prompts.
+        ///
+        /// Path comparison is case-insensitive and tolerates the "Assets/"
+        /// prefix being present or absent on either side (callers may use
+        /// either convention).
+        ///
+        /// Returns false for the empty/null path. Returns false if the
+        /// session timeline has been Reset() since the create_script call.
+        /// </summary>
+        /// <summary>
+        /// Mark a script as created this session by a tool other than create_script
+        /// (e.g. a template tool that writes vetted .cs verbatim). Idempotent.
+        /// </summary>
+        public static void MarkScriptCreated(string scriptPath)
+        {
+            if (string.IsNullOrEmpty(scriptPath)) return;
+            string normalized = NormalizeScriptPath(scriptPath);
+            lock (_lock)
+            {
+                _scriptsCreatedThisSession.Add(normalized);
+            }
+        }
+
+        public static bool WasScriptCreatedThisSession(string scriptPath)
+        {
+            if (string.IsNullOrEmpty(scriptPath)) return false;
+            string normalized = NormalizeScriptPath(scriptPath);
+            lock (_lock)
+            {
+                if (_scriptsCreatedThisSession.Contains(normalized)) return true;
+                for (int i = _timeline.Count - 1; i >= 0; i--)
+                {
+                    var record = _timeline[i];
+                    if (!record.Success) continue;
+                    if (!string.Equals(record.Tool, "create_script", StringComparison.OrdinalIgnoreCase)) continue;
+                    string target = NormalizeScriptPath(record.Target ?? string.Empty);
+                    if (string.Equals(target, normalized, StringComparison.OrdinalIgnoreCase))
+                    {
+                        return true;
+                    }
+                }
+                return false;
+            }
+        }
+
+        private static string NormalizeScriptPath(string path)
+        {
+            if (string.IsNullOrEmpty(path)) return string.Empty;
+            string trimmed = path.Replace('\\', '/');
+            return trimmed.StartsWith("Assets/", StringComparison.OrdinalIgnoreCase)
+                ? trimmed
+                : "Assets/" + trimmed;
+        }
+
+        /// <summary>
         /// Reset the session log. Called only via menu item or test setup.
         /// </summary>
         public static void Reset()
@@ -210,6 +277,7 @@ namespace GladeAgenticAI.Services
             lock (_lock)
             {
                 _timeline.Clear();
+                _scriptsCreatedThisSession.Clear();
                 _totalToolCalls = 0;
                 _successCount = 0;
                 _errorCount = 0;

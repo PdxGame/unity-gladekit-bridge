@@ -73,6 +73,9 @@ namespace GladeAgenticAI.Bridge
         // scraping package.json from disk.
         public string bridgeVersion; // e.g. "0.4.0" — null if package.json unreadable
         public string bridgeKind;    // "mcp" | "agenticai" | null
+        // User-toggled feature flags surfaced to clients so the tool registry
+        // can be filtered before the LLM ever sees it. Default true.
+        public bool assetPipelineEnabled = true;
     }
     
     [Serializable]
@@ -277,6 +280,29 @@ namespace GladeAgenticAI.Bridge
         public bool success;
         public string[] toolNames;
         public string error;
+    }
+
+    /// <summary>
+    /// One in-flight IAsyncTool call's live state. `progress` is in [0,1]
+    /// only when `hasProgress` is true; consumers MUST treat any other value
+    /// as "indeterminate" (e.g. show a marquee, not a bar). `phase` is a
+    /// free-form short label like "downloading" or "extracting" and may be
+    /// empty between phases — never compare to a fixed enum.
+    /// </summary>
+    [Serializable]
+    public class AsyncProgressEntry
+    {
+        public string toolName;
+        public string phase;
+        public float progress;     // [0,1] iff hasProgress, otherwise -1f sentinel
+        public bool hasProgress;
+        public float elapsedSeconds;
+    }
+
+    [Serializable]
+    public class AsyncProgressResponse
+    {
+        public AsyncProgressEntry[] inFlight;
     }
 
     // ===== BATCH EXECUTION MODELS =====

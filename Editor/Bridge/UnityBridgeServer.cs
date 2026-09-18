@@ -17,7 +17,7 @@ namespace GladeAgenticAI.Bridge
 {
     /// <summary>
     /// HTTP server that exposes Unity tool execution and context gathering via REST API.
-    /// Runs on localhost:8765 (automatically falls back to 9000 if the port is taken) and processes requests on Unity main thread.
+    /// Runs on localhost:8765 (or 9000 when 8765 is occupied) and processes requests on the Unity main thread.
     /// </summary>
     [InitializeOnLoad]
     public static class UnityBridgeServer
@@ -27,41 +27,55 @@ namespace GladeAgenticAI.Bridge
         private static bool _isRunning = false;
         private static readonly Queue<HttpListenerContext> _requestQueue = new Queue<HttpListenerContext>();
         private static DateTime _lastRequestTime = DateTime.MinValue;
-        // Candidate ports: prefer 8765; if it is taken (another instance or a stale
-        // socket), immediately fall back to 9000. If both are busy, keep shuttling
-        // between the two until one frees up.
         private static readonly int[] CandidatePorts = { 8765, 9000 };
-        private static int _activePort = 0;
-        private static string _activeUrl = null;
-
-        // Port-shuttle retry: alternates between the candidate ports every few
-        // seconds while both are occupied.
-        private static bool _retryScheduled = false;
+        private static int _activePort;
+        private static string _activeUrl;
+        private static bool _alternateRetryScheduled;
         private static int _lastAttemptedPort = 8765;
-        private static DateTime _lastRetryTime = DateTime.MinValue;
-        private const int RetryIntervalSeconds = 2;
+        private static DateTime _lastAlternateRetryTime = DateTime.MinValue;
+        private const int AlternateRetryIntervalSeconds = 2;
 
-        /// <summary>Port the bridge currently serves on (0 = not running).</summary>
+        /// <summary>Port the bridge is currently serving on; 0 when stopped.</summary>
         public static int CurrentPort => _activePort;
 
-        // Console watcher: main-thread-only event list + dedup tracking
-        private static readonly List<ConsoleLogEvent> _pendingLogEvents = new List<ConsoleLogEvent>();
-        private static readonly Dictionary<string, int> _logDedupCounts = new Dictionary<string, int>();
-        private const int MaxPendingLogEvents = 50;
-
-        private struct ConsoleLogEvent
-        {
-            public string message;
-            public string stackTrace;
-            public string logType;
-            public double timestamp;
-        }
+        // Console / runtime-error capture lives in RuntimeLogStream.cs (a
+        // proper [InitializeOnLoad] service with a 500-entry ring buffer +
+        // monotonic cursors + per-event fingerprints). This handler is now
+        // a thin delegate over that service. The service subscribes to
+        // logMessageReceivedThreaded itself, so we no longer hook it here.
         private const double ConnectionTimeoutSeconds = 10.0; // Consider disconnected if no request in 10 seconds
         private static int _compilationCount = 0;
 
         // Tool call tracking (exposed to GladeKitMCPWindow)
         private static int _toolCallCount = 0;
         private static string _lastToolCalled = null;
+
+        // ── Async tool dispatch ──────────────────────────────────────────────
+        //
+        // Tools that implement IAsyncTool yield back to the Editor between
+        // phases (typically across network waits). For those, HandleToolExecute
+        // calls BeginExecute, parks the HttpListenerContext + handle in
+        // _pendingAsync, and returns from ProcessRequests so the Editor can
+        // paint. Each subsequent EditorApplication.update tick re-enters
+        // PollPendingAsync, which calls Handle.PollResult() on every pending
+        // call — when one returns non-null, the response is sent and the
+        // pending entry is removed.
+        //
+        // 300s deadline parallels the MCP-side per-tool HTTP timeout for
+        // import_asset (mcp-server/src/gladekit_mcp/registry.py). Anything
+        // longer is dead inventory — the upstream caller has already given up.
+        private const double AsyncToolDeadlineSeconds = 300.0;
+
+        private sealed class PendingAsyncCall
+        {
+            public HttpListenerContext Context;
+            public IAsyncToolHandle Handle;
+            public string ToolName;
+            public DateTime Deadline;
+            public DateTime StartedAt;
+        }
+
+        private static readonly List<PendingAsyncCall> _pendingAsync = new List<PendingAsyncCall>();
 
         /// <summary>Whether the bridge HTTP server is currently running.</summary>
         public static bool IsRunning => _isRunning;
@@ -77,47 +91,10 @@ namespace GladeAgenticAI.Bridge
             EditorApplication.update += ProcessRequests;
             CompilationPipeline.compilationFinished -= OnCompilationFinished;
             CompilationPipeline.compilationFinished += OnCompilationFinished;
-            // Console watcher: subscribe on background thread, marshal events to main thread via delayCall
-            Application.logMessageReceivedThreaded -= OnLogMessageReceived;
-            Application.logMessageReceivedThreaded += OnLogMessageReceived;
+            // Runtime log capture is owned by RuntimeLogStream ([InitializeOnLoad]
+            // in unity-bridge/Editor/Services/RuntimeLogStream.cs). It subscribes
+            // on its own static ctor; no hookup needed here.
             StartServer();
-        }
-
-        /// <summary>
-        /// Called on arbitrary threads when Unity logs a message. Marshal to main thread for safe queue access.
-        /// </summary>
-        private static void OnLogMessageReceived(string condition, string stackTrace, LogType type)
-        {
-            // Only capture errors and exceptions
-            if (type != LogType.Error && type != LogType.Exception) return;
-
-            string dedupKey = condition; // Dedup by message text only — NOT stacktrace (line numbers change after recompile)
-            string logTypeName = type.ToString();
-            double ts = (DateTime.UtcNow - new DateTime(1970, 1, 1)).TotalSeconds;
-
-            EditorApplication.delayCall += () =>
-            {
-                lock (_pendingLogEvents)
-                {
-                    if (_logDedupCounts.TryGetValue(dedupKey, out int count))
-                    {
-                        _logDedupCounts[dedupKey] = count + 1;
-                        return; // Already queued; just increment count, don't add duplicate
-                    }
-                    _logDedupCounts[dedupKey] = 1;
-
-                    if (_pendingLogEvents.Count >= MaxPendingLogEvents)
-                        return; // Queue full — drop this event
-
-                    _pendingLogEvents.Add(new ConsoleLogEvent
-                    {
-                        message = condition,
-                        stackTrace = stackTrace,
-                        logType = logTypeName,
-                        timestamp = ts,
-                    });
-                }
-            };
         }
 
         private static void OnCompilationFinished(object obj)
@@ -136,21 +113,20 @@ namespace GladeAgenticAI.Bridge
                 return;
             }
 
-            // Fast pass: try 8765 first, then 9000 immediately.
             foreach (int port in CandidatePorts)
             {
                 if (TryStartOnPort(port))
+                {
                     return;
+                }
             }
 
-            // Both ports busy: keep shuttling between them until one frees up.
             Debug.LogWarning(
-                $"[UnityBridge] 端口 {CandidatePorts[0]}/{CandidatePorts[1]} 均被占用，" +
-                "将在这两个端口之间来回重试（每 " + RetryIntervalSeconds + " 秒一次）。");
+                $"[UnityBridge] Ports {CandidatePorts[0]}/{CandidatePorts[1]} are both occupied. " +
+                $"Retrying every {AlternateRetryIntervalSeconds} seconds.");
             ScheduleAlternateRetry();
         }
 
-        /// <summary>Attempt to bind one candidate port and, on success, start the listener thread.</summary>
         private static bool TryStartOnPort(int port)
         {
             HttpListener candidate = null;
@@ -159,6 +135,7 @@ namespace GladeAgenticAI.Bridge
                 candidate = new HttpListener();
                 candidate.Prefixes.Add($"http://localhost:{port}/");
                 candidate.Start();
+
                 _listener = candidate;
                 _activePort = port;
                 _activeUrl = $"http://localhost:{port}/";
@@ -170,27 +147,28 @@ namespace GladeAgenticAI.Bridge
                     Name = "UnityBridgeServer"
                 };
                 _listenerThread.Start();
-                
-                Debug.Log($"[UnityBridge] ✅ Server started successfully on {_activeUrl}");
-                Debug.Log($"[UnityBridge] 📋 Ready to accept requests. Tools list endpoint: {_activeUrl}api/tools/list");
-                if (_activePort != CandidatePorts[0])
-                    Debug.Log($"[UnityBridge] ⚠️ 端口 {CandidatePorts[0]} 被占用，本桥改在 {_activePort} 上监听。");
+
+                Debug.Log($"[UnityBridge] Server started successfully on {_activeUrl}");
+                Debug.Log($"[UnityBridge] Ready to accept requests. Tools list endpoint: {_activeUrl}api/tools/list");
+                BridgeDiagnostics.Info("StartServer", $"Bridge started on {_activeUrl}");
                 return true;
             }
             catch (Exception e)
             {
                 try { candidate?.Close(); } catch { }
-                Debug.LogWarning($"[UnityBridge] 端口 {port} 不可用（{e.Message}），自动切换到另一个端口…");
+                Debug.LogWarning($"[UnityBridge] Port {port} unavailable ({e.Message}); trying the alternate port.");
                 return false;
             }
         }
 
-        /// <summary>Schedule the shuttle retry on the editor update loop.</summary>
         private static void ScheduleAlternateRetry()
         {
-            if (_retryScheduled) return;
-            _retryScheduled = true;
-            _lastRetryTime = DateTime.MinValue;
+            if (_alternateRetryScheduled)
+            {
+                return;
+            }
+
+            _alternateRetryScheduled = true;
             EditorApplication.update += OnAlternateRetryTick;
         }
 
@@ -202,24 +180,29 @@ namespace GladeAgenticAI.Bridge
                 return;
             }
 
-            if ((DateTime.UtcNow - _lastRetryTime).TotalSeconds < RetryIntervalSeconds)
+            if ((DateTime.UtcNow - _lastAlternateRetryTime).TotalSeconds < AlternateRetryIntervalSeconds)
+            {
                 return;
-            _lastRetryTime = DateTime.UtcNow;
+            }
 
-            // Shuttle: try the port we did NOT attempt last time.
-            int next = _lastAttemptedPort == CandidatePorts[0] ? CandidatePorts[1] : CandidatePorts[0];
-            _lastAttemptedPort = next;
-            if (TryStartOnPort(next))
+            _lastAlternateRetryTime = DateTime.UtcNow;
+            int nextPort = _lastAttemptedPort == CandidatePorts[0] ? CandidatePorts[1] : CandidatePorts[0];
+            _lastAttemptedPort = nextPort;
+            if (TryStartOnPort(nextPort))
+            {
                 CancelAlternateRetry();
+            }
         }
 
         private static void CancelAlternateRetry()
         {
-            if (_retryScheduled)
+            if (!_alternateRetryScheduled)
             {
-                EditorApplication.update -= OnAlternateRetryTick;
-                _retryScheduled = false;
+                return;
             }
+
+            EditorApplication.update -= OnAlternateRetryTick;
+            _alternateRetryScheduled = false;
         }
 
         /// <summary>
@@ -235,8 +218,50 @@ namespace GladeAgenticAI.Bridge
             _listener?.Stop();
             _listener?.Close();
             _listener = null;
+            _activePort = 0;
+            _activeUrl = null;
+
+            // Drop any in-flight async tool handles. Don't try to send a
+            // graceful error to the client — at this point we may be in
+            // shutdown / domain-reload territory and the listener is gone.
+            int dropped = _pendingAsync.Count;
+            foreach (var pending in _pendingAsync)
+            {
+                try { pending.Handle.Dispose(); } catch { /* ignore */ }
+            }
+            _pendingAsync.Clear();
+
+            // Drain any queued requests waiting on the main thread. Without
+            // this, a Restart leaves stale HttpListenerContext handles that
+            // belong to a dead listener — the next ProcessRequests tick would
+            // try to write to a closed stream and log a confusing error.
+            int queued = 0;
+            lock (_requestQueue)
+            {
+                queued = _requestQueue.Count;
+                while (_requestQueue.Count > 0)
+                {
+                    var ctx = _requestQueue.Dequeue();
+                    try { ctx.Response.Abort(); } catch { /* listener already closed */ }
+                }
+            }
 
             Debug.Log("[UnityBridge] Server stopped");
+            BridgeDiagnostics.Info(
+                "StopServer",
+                $"Bridge stopped (dropped {dropped} async, {queued} queued)");
+        }
+
+        /// <summary>
+        /// Stop and restart the bridge in one call. Exists so users can
+        /// recover from a wedged state (e.g. after a long AssetDatabase.Refresh
+        /// that timed out the MCP client) without restarting Unity.
+        /// </summary>
+        public static void RestartServer()
+        {
+            BridgeDiagnostics.Info("RestartServer", "Restart requested");
+            StopServer();
+            StartServer();
         }
 
         /// <summary>
@@ -303,19 +328,139 @@ namespace GladeAgenticAI.Bridge
             List<HttpListenerContext> toProcess = null;
             lock (_requestQueue)
             {
-                if (_requestQueue.Count == 0)
-                    return;
-                toProcess = new List<HttpListenerContext>(_requestQueue.Count);
-                while (_requestQueue.Count > 0)
+                if (_requestQueue.Count > 0)
                 {
-                    toProcess.Add(_requestQueue.Dequeue());
+                    toProcess = new List<HttpListenerContext>(_requestQueue.Count);
+                    while (_requestQueue.Count > 0)
+                    {
+                        toProcess.Add(_requestQueue.Dequeue());
+                    }
                 }
             }
 
-            foreach (var context in toProcess)
+            if (toProcess != null)
             {
-                HandleRequest(context);
+                foreach (var context in toProcess)
+                {
+                    HandleRequest(context);
+                }
             }
+
+            // Drain completed async tool calls. Runs every tick — cheap when
+            // _pendingAsync is empty (the common case).
+            PollPendingAsync();
+        }
+
+        /// <summary>
+        /// One pass over pending IAsyncTool handles. Sends the response for
+        /// any that completed (or timed out) and removes them from the list.
+        /// Called from <see cref="ProcessRequests"/> on the Unity main thread.
+        /// </summary>
+        private static void PollPendingAsync()
+        {
+            if (_pendingAsync.Count == 0) return;
+
+            // Iterate backwards so in-place removal is safe.
+            for (int i = _pendingAsync.Count - 1; i >= 0; i--)
+            {
+                var pending = _pendingAsync[i];
+                string result = null;
+                bool deadlineHit = DateTime.UtcNow > pending.Deadline;
+
+                try
+                {
+                    result = deadlineHit
+                        ? ToolUtils.CreateErrorResponse(
+                            $"Tool {pending.ToolName} exceeded async deadline of {AsyncToolDeadlineSeconds:F0}s")
+                        : pending.Handle.PollResult();
+                }
+                catch (Exception e)
+                {
+                    Debug.LogError($"[UnityBridge] Async tool '{pending.ToolName}' threw during poll: {e}");
+                    BridgeDiagnostics.Error(pending.ToolName, $"async fault: {e.Message}");
+                    result = ToolUtils.CreateErrorResponse($"Async tool '{pending.ToolName}' faulted: {e.Message}");
+                }
+
+                if (deadlineHit && result != null)
+                {
+                    BridgeDiagnostics.Warn(
+                        pending.ToolName,
+                        $"async deadline {AsyncToolDeadlineSeconds:F0}s exceeded");
+                }
+
+                if (result == null) continue; // still working
+
+                try { pending.Handle.Dispose(); } catch { /* best-effort cleanup */ }
+
+                _toolCallCount++;
+                _lastToolCalled = pending.ToolName;
+                // SessionTracker uses the original args; we don't have them here
+                // (parsed inside ToolExecutor.TryBeginAsync). Recording the result
+                // without args is still useful for the activity feed.
+                SessionTracker.Record(pending.ToolName, "{}", result);
+
+                var toolResponse = new ToolExecuteResponse
+                {
+                    success = true,
+                    result = result,
+                    requiresCompilation = ToolRequiresCompilation(pending.ToolName),
+                    compilationCount = ToolRequiresCompilation(pending.ToolName) ? _compilationCount : -1,
+                    error = null,
+                };
+
+                try
+                {
+                    SendJson(pending.Context.Response, toolResponse);
+                }
+                catch (Exception e)
+                {
+                    Debug.LogWarning($"[UnityBridge] Failed to send async tool response for '{pending.ToolName}': {e.Message}");
+                }
+
+                _pendingAsync.RemoveAt(i);
+            }
+        }
+
+        // Origins permitted to reach the bridge from a browser context. The
+        // desktop UI is a browser-based page, so its fetch() carries an Origin:
+        // in development it loads from a local dev server (port 5173); in a
+        // packaged build it loads from file://, which the browser reports as
+        // the opaque origin "null". Native clients (MCP server, editors) send
+        // no Origin and bypass this list entirely.
+        private static readonly HashSet<string> AllowedOrigins = new HashSet<string>(StringComparer.Ordinal)
+        {
+            "http://localhost:5173",
+            "http://127.0.0.1:5173",
+            "null",
+        };
+
+        /// <summary>
+        /// True if the Host header targets the local loopback interface. Blocks
+        /// DNS-rebinding, where a remote name resolves to 127.0.0.1 and the
+        /// victim's browser sends the attacker's host. Missing Host is rejected
+        /// (every real HTTP/1.1 client sends one).
+        /// </summary>
+        internal static bool IsHostAllowed(string hostHeader)
+        {
+            if (string.IsNullOrEmpty(hostHeader)) return false;
+            // Strip the optional ":port" — IPv6 hosts arrive bracketed ("[::1]:8765")
+            // so split on the last colon only when it isn't inside brackets.
+            string host = hostHeader;
+            int colon = host.LastIndexOf(':');
+            int bracket = host.LastIndexOf(']');
+            if (colon > bracket) host = host.Substring(0, colon);
+            host = host.Trim().ToLowerInvariant();
+            return host == "localhost" || host == "127.0.0.1" || host == "[::1]" || host == "::1";
+        }
+
+        /// <summary>
+        /// True if a browser Origin is permitted. Empty/null input means the
+        /// request carried no Origin (a non-browser client) and is allowed.
+        /// </summary>
+        internal static bool IsOriginAllowed(string origin)
+        {
+            if (string.IsNullOrEmpty(origin)) return true;
+            return AllowedOrigins.Contains(origin);
         }
 
         /// <summary>
@@ -326,10 +471,42 @@ namespace GladeAgenticAI.Bridge
             var request = context.Request;
             var response = context.Response;
 
-            // Add CORS headers so browser-based and desktop clients can connect
-            response.AddHeader("Access-Control-Allow-Origin", "*");
-            response.AddHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-            response.AddHeader("Access-Control-Allow-Headers", "Content-Type");
+            // ── Local-only access control ────────────────────────────────────
+            // The bridge binds to localhost, but "bound to localhost" is not the
+            // same as "only reachable by local apps". A web page the user visits
+            // can target http://localhost:8765 directly, and DNS-rebinding can
+            // make a remote origin resolve to 127.0.0.1. Two cheap checks close
+            // both holes without disrupting legitimate clients:
+            //
+            //   1. Host header must be localhost/127.0.0.1 — blocks DNS
+            //      rebinding (the rebinding victim's browser sends Host: evil.com).
+            //   2. Origin, when present, must be on the allowlist — blocks a
+            //      drive-by web page. Native clients (MCP server, editors, curl)
+            //      send no Origin and are unaffected; our own UI is allowlisted.
+            //
+            // For an allowed Origin we reflect it (never "*") so the browser can
+            // still read responses; for a disallowed one the (preflighted) write
+            // request is blocked by the browser before it executes.
+            string hostHeader = request.Headers["Host"];
+            if (!IsHostAllowed(hostHeader))
+            {
+                SendError(response, 403, "Forbidden: host not allowed");
+                return;
+            }
+
+            string origin = request.Headers["Origin"];
+            if (!string.IsNullOrEmpty(origin))
+            {
+                if (!IsOriginAllowed(origin))
+                {
+                    SendError(response, 403, "Forbidden: origin not allowed");
+                    return;
+                }
+                response.AddHeader("Access-Control-Allow-Origin", origin);
+                response.AddHeader("Vary", "Origin");
+                response.AddHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+                response.AddHeader("Access-Control-Allow-Headers", "Content-Type");
+            }
 
             // Handle preflight OPTIONS request
             if (request.HttpMethod == "OPTIONS")
@@ -417,6 +594,10 @@ namespace GladeAgenticAI.Bridge
                 {
                     HandleToolsList(context);
                 }
+                else if (path == "/api/async/progress" && method == "GET")
+                {
+                    HandleAsyncProgress(context);
+                }
                 else
                 {
                     SendError(response, 404, "Not Found");
@@ -425,6 +606,7 @@ namespace GladeAgenticAI.Bridge
             catch (Exception e)
             {
                 Debug.LogError($"[UnityBridge] Error handling request: {e}");
+                BridgeDiagnostics.Error("HandleRequest", $"{path}: {e.Message}");
                 SendError(response, 500, $"Internal Server Error: {e.Message}");
             }
         }
@@ -443,7 +625,8 @@ namespace GladeAgenticAI.Bridge
                 projectPath = Path.GetFullPath(Path.Combine(Application.dataPath, "..")),
                 isCompiling = EditorApplication.isCompiling,
                 bridgeVersion = bridgeVersion,
-                bridgeKind = bridgeKind
+                bridgeKind = bridgeKind,
+                assetPipelineEnabled = AssetPipelineGuard.IsEnabled
             };
 
             SendJson(context.Response, response);
@@ -549,6 +732,75 @@ namespace GladeAgenticAI.Bridge
         }
 
         /// <summary>
+        /// Handle GET /api/async/progress — read-only snapshot of every
+        /// in-flight IAsyncTool call. Intended to be polled at ~1Hz by a
+        /// client while dispatching a long-running tool (e.g. import_asset)
+        /// so the user sees a live phase + percent indicator rather than a
+        /// silent connection during a large download. The response is
+        /// independent of any per-call id: clients match entries by
+        /// toolName + position, which is sufficient given the typical case
+        /// is one async tool in flight at a time.
+        /// </summary>
+        private static void HandleAsyncProgress(HttpListenerContext context)
+        {
+            var now = DateTime.UtcNow;
+            var snapshots = new List<(string toolName, IAsyncToolHandle handle, DateTime startedAt)>(_pendingAsync.Count);
+            foreach (var pending in _pendingAsync)
+            {
+                snapshots.Add((pending.ToolName, pending.Handle, pending.StartedAt));
+            }
+            var entries = BuildAsyncProgressSnapshot(snapshots, now);
+            SendJson(context.Response, new AsyncProgressResponse { inFlight = entries });
+        }
+
+        /// <summary>
+        /// Pure-data shaper for the /api/async/progress response. Extracted
+        /// from the route handler so it can be unit-tested without spinning
+        /// up an HttpListener. Tolerant of misbehaving handles — any tool
+        /// whose Phase/Progress getter throws is reported with a sentinel
+        /// indeterminate entry rather than aborting the whole snapshot.
+        /// </summary>
+        internal static AsyncProgressEntry[] BuildAsyncProgressSnapshot(
+            IReadOnlyList<(string toolName, IAsyncToolHandle handle, DateTime startedAt)> snapshots,
+            DateTime now)
+        {
+            var entries = new AsyncProgressEntry[snapshots.Count];
+            for (int i = 0; i < snapshots.Count; i++)
+            {
+                var (toolName, handle, startedAt) = snapshots[i];
+                string phase = "";
+                float progress = -1f;
+                bool hasProgress = false;
+                try
+                {
+                    phase = handle?.Phase ?? "";
+                    var p = handle?.Progress;
+                    if (p.HasValue)
+                    {
+                        hasProgress = true;
+                        progress = p.Value;
+                    }
+                }
+                catch (Exception e)
+                {
+                    // Never let a misbehaving tool getter break the endpoint —
+                    // the whole point is to be a heartbeat while work is alive.
+                    Debug.LogWarning($"[UnityBridge] Async tool '{toolName}' threw during progress read: {e.Message}");
+                }
+
+                entries[i] = new AsyncProgressEntry
+                {
+                    toolName = toolName ?? "",
+                    phase = phase,
+                    progress = progress,
+                    hasProgress = hasProgress,
+                    elapsedSeconds = (float)(now - startedAt).TotalSeconds,
+                };
+            }
+            return entries;
+        }
+
+        /// <summary>
         /// Handle GET /api/tools/list
         /// </summary>
         private static void HandleToolsList(HttpListenerContext context)
@@ -618,7 +870,49 @@ namespace GladeAgenticAI.Bridge
                     return;
                 }
 
-                // Execute the tool
+                // ── Async dispatch path ──────────────────────────────────
+                // Tools implementing IAsyncTool yield back to the Editor's
+                // update loop between phases — typically across a network
+                // wait. The response is sent later by PollPendingAsync once
+                // the handle reports completion. Returning here keeps the
+                // HttpListenerContext alive (HttpListener doesn't close the
+                // connection until response.Close() is called).
+                var asyncBegin = ToolExecutor.TryBeginAsync(request.toolName, request.arguments);
+                if (asyncBegin != null)
+                {
+                    if (asyncBegin.ImmediateResult != null)
+                    {
+                        // Validation rejected before any async work began —
+                        // record + send synchronously, same shape as the sync
+                        // path below.
+                        _toolCallCount++;
+                        _lastToolCalled = request.toolName;
+                        SessionTracker.Record(request.toolName, request.arguments, asyncBegin.ImmediateResult);
+                        var rejectedResponse = new ToolExecuteResponse
+                        {
+                            success = true,
+                            result = asyncBegin.ImmediateResult,
+                            requiresCompilation = false,
+                            compilationCount = -1,
+                            error = null,
+                        };
+                        SendJson(context.Response, rejectedResponse);
+                        return;
+                    }
+
+                    var now = DateTime.UtcNow;
+                    _pendingAsync.Add(new PendingAsyncCall
+                    {
+                        Context = context,
+                        Handle = asyncBegin.Handle,
+                        ToolName = request.toolName,
+                        Deadline = now.AddSeconds(AsyncToolDeadlineSeconds),
+                        StartedAt = now,
+                    });
+                    return;
+                }
+
+                // ── Sync dispatch path (unchanged) ───────────────────────
                 string result = ToolExecutor.ExecuteTool(request.toolName, request.arguments);
                 _toolCallCount++;
                 _lastToolCalled = request.toolName;
@@ -641,6 +935,7 @@ namespace GladeAgenticAI.Bridge
             catch (Exception e)
             {
                 Debug.LogError($"[UnityBridge] Tool execution error: {e}");
+                BridgeDiagnostics.Error("tool_execute", e.Message);
                 var errorResponse = new ToolExecuteResponse
                 {
                     success = false,
@@ -714,8 +1009,13 @@ namespace GladeAgenticAI.Bridge
                     return;
                 }
 
+                // No batch-level requiresCompilation aggregate is tracked here on
+                // purpose: BatchExecuteResponse has no such field, and the client
+                // already derives it from the per-item flags
+                // (mcp-server bridge.py: `any(r.get("requiresCompilation") ...)`).
+                // A server-side copy would be a second source of truth for the
+                // same fact — it existed as a write-only local and was removed.
                 var results = new BatchToolResult[request.calls.Length];
-                bool anyRequiresCompilation = false;
 
                 for (int i = 0; i < request.calls.Length; i++)
                 {
@@ -743,13 +1043,12 @@ namespace GladeAgenticAI.Bridge
                         toolResult.success = true;
                         toolResult.result = result;
                         toolResult.requiresCompilation = ToolRequiresCompilation(call.toolName);
-                        if (toolResult.requiresCompilation)
-                            anyRequiresCompilation = true;
                     }
                     catch (Exception e)
                     {
                         toolResult.success = false;
                         toolResult.error = e.Message;
+                        BridgeDiagnostics.Error(call.toolName ?? "batch_item", e.Message);
                     }
 
                     results[i] = toolResult;
@@ -1077,30 +1376,24 @@ namespace GladeAgenticAI.Bridge
         }
 
         /// <summary>
-        /// Handle GET /api/console/events — returns and clears pending error/exception log events.
-        /// NOTE: This handler runs on the HttpListener background thread.
-        /// _pendingLogEvents is only written from the main thread (via EditorApplication.delayCall),
-        /// but drained here. Use a lock for thread-safe drain.
+        /// Handle GET /api/console/events — returns and clears pending error/
+        /// exception log events. Delegates to RuntimeLogStream which owns the
+        /// underlying ring buffer. Wire shape preserved exactly so the
+        /// renderer's useConsoleWatcher.ts continues to work unchanged.
         /// </summary>
         private static void HandleConsoleEvents(HttpListenerContext context)
         {
-            List<ConsoleLogEvent> snapshot;
-            lock (_pendingLogEvents)
-            {
-                snapshot = new List<ConsoleLogEvent>(_pendingLogEvents);
-                _pendingLogEvents.Clear();
-                _logDedupCounts.Clear();
-            }
+            var snapshot = RuntimeLogStream.DrainWithConditionDedup();
 
             var events = new List<object>();
             foreach (var evt in snapshot)
             {
                 events.Add(new
                 {
-                    message = evt.message,
-                    stackTrace = evt.stackTrace,
-                    logType = evt.logType,
-                    timestamp = evt.timestamp,
+                    message = evt.Message,
+                    stackTrace = evt.StackTrace,
+                    logType = evt.LogType,
+                    timestamp = evt.Timestamp,
                 });
             }
 
@@ -1134,7 +1427,18 @@ namespace GladeAgenticAI.Bridge
                 {
                     filePath = "Assets/" + filePath;
                 }
-                
+
+                if (!ToolUtils.IsPathInsideProject(filePath))
+                {
+                    SendJson(context.Response, new FileBackupResponse
+                    {
+                        success = false,
+                        backupPath = "",
+                        error = "filePath escapes the project root"
+                    });
+                    return;
+                }
+
                 if (!File.Exists(filePath))
                 {
                     var errorResponse = new FileBackupResponse
@@ -1148,7 +1452,7 @@ namespace GladeAgenticAI.Bridge
                 }
                 
                 // Create backup path
-                string backupDir = Path.Combine(".gladekit-backups", $"turn-{request.turnId}", "files");
+                string backupDir = Path.Combine(".gladekit-backups", BackupManager.TurnSubdir(request.turnId), "files");
                 string relativePath = filePath.Replace("Assets/", "");
                 string backupPath = Path.Combine(backupDir, relativePath);
                 string backupDirPath = Path.GetDirectoryName(backupPath);
@@ -1333,6 +1637,12 @@ namespace GladeAgenticAI.Bridge
                             // Delete created file
                             // Normalize path (Unity uses forward slashes)
                             string normalizedPath = change.filePath.Replace('\\', '/');
+
+                            if (!ToolUtils.IsPathInsideProject(normalizedPath))
+                            {
+                                Debug.LogWarning($"[TurnRevert] Refusing to delete path outside project root: {normalizedPath}");
+                                continue;
+                            }
                             
                             if (File.Exists(normalizedPath))
                             {
@@ -1363,6 +1673,12 @@ namespace GladeAgenticAI.Bridge
                             // Restore from backup
                             if (!string.IsNullOrEmpty(change.backupPath) && File.Exists(change.backupPath))
                             {
+                                if (!ToolUtils.IsPathInsideProject(change.filePath)
+                                    || !ToolUtils.IsPathInsideProject(change.backupPath))
+                                {
+                                    Debug.LogWarning($"[TurnRevert] Refusing to restore path outside project root: {change.filePath}");
+                                    continue;
+                                }
                                 string dir = Path.GetDirectoryName(change.filePath);
                                 if (!Directory.Exists(dir))
                                 {
@@ -1488,7 +1804,7 @@ namespace GladeAgenticAI.Bridge
                 
                 // Delete backup folders after revert (cleanup)
                 // 1. JSON backups in .gladekit-backups/
-                string backupDir = Path.Combine(".gladekit-backups", $"turn-{request.turnId}");
+                string backupDir = Path.Combine(".gladekit-backups", BackupManager.TurnSubdir(request.turnId));
                 if (Directory.Exists(backupDir))
                 {
                     try
@@ -1503,7 +1819,7 @@ namespace GladeAgenticAI.Bridge
                 }
                 
                 // 2. Prefab backups in Assets/Temp/GladeKitBackups/
-                string prefabBackupDir = Path.Combine("Assets", "Temp", "GladeKitBackups", $"turn-{request.turnId}");
+                string prefabBackupDir = Path.Combine("Assets", "Temp", "GladeKitBackups", BackupManager.TurnSubdir(request.turnId));
                 if (Directory.Exists(prefabBackupDir))
                 {
                     try
@@ -1566,7 +1882,7 @@ namespace GladeAgenticAI.Bridge
                 
                 // Delete backup folders for this turn
                 // 1. JSON backups in .gladekit-backups/
-                string backupDir = Path.Combine(".gladekit-backups", $"turn-{request.turnId}");
+                string backupDir = Path.Combine(".gladekit-backups", BackupManager.TurnSubdir(request.turnId));
                 if (Directory.Exists(backupDir))
                 {
                     try
@@ -1585,7 +1901,7 @@ namespace GladeAgenticAI.Bridge
                 }
                 
                 // 2. Prefab backups in Assets/Temp/GladeKitBackups/
-                string prefabBackupDir = Path.Combine("Assets", "Temp", "GladeKitBackups", $"turn-{request.turnId}");
+                string prefabBackupDir = Path.Combine("Assets", "Temp", "GladeKitBackups", BackupManager.TurnSubdir(request.turnId));
                 if (Directory.Exists(prefabBackupDir))
                 {
                     try
@@ -1719,7 +2035,10 @@ namespace GladeAgenticAI.Bridge
         }
 
         /// <summary>
-        /// Handle settings update request
+        /// Handle settings update request. Reads optional bool fields manually because
+        /// JsonUtility silently drops <c>Nullable&lt;bool&gt;</c> fields, which made the
+        /// pre-2026-05-07 implementation a no-op in production (verified live: no
+        /// "Updated referenceDemoAssets" log fired despite repeated POSTs).
         /// </summary>
         private static void HandleSettings(HttpListenerContext context)
         {
@@ -1729,18 +2048,30 @@ namespace GladeAgenticAI.Bridge
                 using (var reader = new StreamReader(context.Request.InputStream, Encoding.UTF8))
                 {
                     string json = reader.ReadToEnd();
-                    var settings = JsonUtility.FromJson<SettingsRequest>(json);
-                    
-                    if (settings.referenceDemoAssets.HasValue)
+
+                    // Only write + log on an ACTUAL change. The client re-POSTs
+                    // the current settings on mount / reconnect, so an unguarded
+                    // write logged on every POST and spammed the console (and
+                    // churned EditorPrefs) with redundant no-op updates.
+                    bool? referenceDemoAssets = TryReadBoolField(json, "referenceDemoAssets");
+                    if (referenceDemoAssets.HasValue
+                        && EditorPrefs.GetBool("GladeAI.ReferenceDemoAssets", true) != referenceDemoAssets.Value)
                     {
-                        EditorPrefs.SetBool("GladeAI.ReferenceDemoAssets", settings.referenceDemoAssets.Value);
-                        Debug.Log($"[UnityBridge] Updated referenceDemoAssets setting: {settings.referenceDemoAssets.Value}");
+                        EditorPrefs.SetBool("GladeAI.ReferenceDemoAssets", referenceDemoAssets.Value);
+                        Debug.Log($"[UnityBridge] Updated referenceDemoAssets setting: {referenceDemoAssets.Value}");
                     }
-                    
-                    var result = new { success = true };
-                    string resultJson = JsonUtility.ToJson(result);
-                    byte[] buffer = Encoding.UTF8.GetBytes(resultJson);
-                    
+
+                    bool? assetPipelineEnabled = TryReadBoolField(json, "assetPipelineEnabled");
+                    if (assetPipelineEnabled.HasValue
+                        && AssetPipelineGuard.IsEnabled != assetPipelineEnabled.Value)
+                    {
+                        AssetPipelineGuard.SetEnabled(assetPipelineEnabled.Value);
+                        Debug.Log($"[UnityBridge] Updated assetPipelineEnabled setting: {assetPipelineEnabled.Value}");
+                    }
+
+                    // Plain anonymous types don't serialize through JsonUtility — emit literal JSON.
+                    byte[] buffer = Encoding.UTF8.GetBytes("{\"success\":true}");
+
                     response.ContentType = "application/json";
                     response.ContentLength64 = buffer.Length;
                     response.StatusCode = 200;
@@ -1757,11 +2088,15 @@ namespace GladeAgenticAI.Bridge
                 response.Close();
             }
         }
-        
-        [System.Serializable]
-        private class SettingsRequest
+
+        private static bool? TryReadBoolField(string json, string fieldName)
         {
-            public bool? referenceDemoAssets;
+            if (string.IsNullOrEmpty(json)) return null;
+            string pattern = "\"" + System.Text.RegularExpressions.Regex.Escape(fieldName) + "\"\\s*:\\s*(true|false)";
+            var match = System.Text.RegularExpressions.Regex.Match(
+                json, pattern, System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            if (!match.Success) return null;
+            return string.Equals(match.Groups[1].Value, "true", StringComparison.OrdinalIgnoreCase);
         }
 
         /// <summary>

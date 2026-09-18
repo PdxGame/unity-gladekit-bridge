@@ -33,15 +33,37 @@ namespace GladeAgenticAI.Services
         {
             if (string.IsNullOrEmpty(path)) return null;
             if (DemoAssetsGuard.AllowUseOfDemoAssetPath(path)) return null;
-            return $"{{\"error\":\"Demo assets are disabled in Settings. Enable 'Reference existing demo assets in project' to use assets in Assets/Editor/GladeAgenticAI/DemoAssets.\"}}";
+            return "{\"error\":\"Demo assets are disabled in Settings. Enable 'Reference demo assets' to use bundled demo content (Assets/DemoAssets or Packages/com.gladekit.agenticai/DemoAssets).\"}";
         }
 
         private static readonly string[] AssetPathArgKeys = new[]
         {
             "assetPath", "prefabPath", "scenePath", "materialPath", "controllerPath", "clipPath",
             "sourcePath", "destinationPath", "scriptPath", "texturePath", "skyboxMaterial", "profilePath",
-            "avatarMaskPath", "maskPath", "meshPath", "dataPath", "terrainDataPath", "spritePath", "folderPath"
+            "avatarMaskPath", "maskPath", "meshPath", "dataPath", "terrainDataPath", "spritePath", "folderPath",
+            "targetPath"
         };
+
+        /// <summary>
+        /// Checks all path-like arguments for directory traversal; returns an
+        /// error JSON string if any would escape the project root. Runs before
+        /// the demo-path check and before any tool executes, so no write tool
+        /// ever sees a "../" path. See ToolUtils.IsAssetPathSafe.
+        /// </summary>
+        private static string RejectIfAnyArgPathEscapesProject(Dictionary<string, object> args)
+        {
+            if (args == null) return null;
+            foreach (string key in AssetPathArgKeys)
+            {
+                if (!args.TryGetValue(key, out var val) || val == null) continue;
+                string path = val.ToString();
+                if (string.IsNullOrWhiteSpace(path)) continue;
+                if (!ToolUtils.IsAssetPathSafe(path))
+                    return ToolUtils.CreateErrorResponse(
+                        $"Invalid path for '{key}': directory traversal ('..') is not allowed.");
+            }
+            return null;
+        }
 
         /// <summary>Checks all path-like arguments in args; returns error JSON if any is a disallowed demo path.</summary>
         private static string RejectIfAnyArgPathIsDemoDisallowed(Dictionary<string, object> args)
@@ -52,7 +74,12 @@ namespace GladeAgenticAI.Services
                 if (!args.TryGetValue(key, out var val) || val == null) continue;
                 string path = val.ToString();
                 if (string.IsNullOrWhiteSpace(path)) continue;
-                if (!path.StartsWith("Assets/", StringComparison.OrdinalIgnoreCase))
+                // Accept Asset-relative inputs by prepending "Assets/", but preserve
+                // "Packages/..." UPM AssetDatabase paths verbatim — DemoAssets can live
+                // in a deployed UPM package (Packages/com.gladekit.agenticai/DemoAssets/).
+                bool rooted = path.StartsWith("Assets/", StringComparison.OrdinalIgnoreCase)
+                              || path.StartsWith("Packages/", StringComparison.OrdinalIgnoreCase);
+                if (!rooted)
                     path = "Assets/" + path.TrimStart('/');
                 var err = RejectIfDemoPathDisallowed(path);
                 if (err != null) return err;
@@ -66,6 +93,8 @@ namespace GladeAgenticAI.Services
             {
                 EnsureRegistry();
                 var args = ToolUtils.ParseJsonToDict(argumentsJson);
+                var traversalErr = RejectIfAnyArgPathEscapesProject(args);
+                if (traversalErr != null) return traversalErr;
                 var demoErr = RejectIfAnyArgPathIsDemoDisallowed(args);
                 if (demoErr != null) return demoErr;
 
@@ -79,6 +108,61 @@ namespace GladeAgenticAI.Services
             {
                 return ToolUtils.CreateErrorResponse($"Execution failed: {e.Message}");
             }
+        }
+
+        /// <summary>
+        /// Try to begin an async tool invocation. Returns a populated
+        /// <see cref="AsyncBeginResult"/> if the resolved tool implements
+        /// <see cref="IAsyncTool"/>; returns null if the tool isn't async or
+        /// doesn't exist (caller should fall through to <see cref="ExecuteTool"/>
+        /// for the sync path).
+        ///
+        /// <para>
+        /// The full security gate runs here exactly as in <see cref="ExecuteTool"/> —
+        /// directory-traversal rejection AND demo-path rejection — so an async tool
+        /// never sees a "../" or otherwise escaping path. When a call is blocked the
+        /// returned result has <c>Handle</c> = null and <c>ImmediateResult</c>
+        /// populated with the same error envelope sync callers would see. This keeps
+        /// the security gate in one place across the sync and async dispatch paths.
+        /// </para>
+        /// </summary>
+        public static AsyncBeginResult TryBeginAsync(string toolName, string argumentsJson)
+        {
+            EnsureRegistry();
+            var tool = _registry.GetTool(toolName);
+            if (!(tool is IAsyncTool asyncTool)) return null;
+
+            try
+            {
+                var args = ToolUtils.ParseJsonToDict(argumentsJson);
+                var traversalErr = RejectIfAnyArgPathEscapesProject(args);
+                if (traversalErr != null) return new AsyncBeginResult { ImmediateResult = traversalErr };
+                var demoErr = RejectIfAnyArgPathIsDemoDisallowed(args);
+                if (demoErr != null) return new AsyncBeginResult { ImmediateResult = demoErr };
+
+                var handle = asyncTool.BeginExecute(args);
+                return new AsyncBeginResult { Handle = handle };
+            }
+            catch (Exception e)
+            {
+                return new AsyncBeginResult
+                {
+                    ImmediateResult = ToolUtils.CreateErrorResponse($"Execution failed: {e.Message}")
+                };
+            }
+        }
+
+        public sealed class AsyncBeginResult
+        {
+            /// <summary>Non-null when the tool started async work; bridge should poll.</summary>
+            public IAsyncToolHandle Handle;
+
+            /// <summary>
+            /// Non-null when validation rejected the call before async work began
+            /// (demo-path block, arg parse failure). Bridge should send this as
+            /// the response immediately, no polling needed.
+            /// </summary>
+            public string ImmediateResult;
         }
     }
 }

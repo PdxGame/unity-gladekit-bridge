@@ -1,15 +1,15 @@
 # GladeKit MCP Bridge（Unity 2022.3 本地化版插件）
 
-**GladeKit MCP Bridge** 的本地化维护版（`com.gladekit.mcp-bridge` v0.4.3，锁定 Unity 2022.3 LTS）。
+**GladeKit MCP Bridge** 的本地化维护版（`com.gladekit.mcp-bridge` v0.7.23-pdx.1，锁定 Unity 2022.3 LTS）。
 
-> ⚠️ 此仓库**不跟踪官方 Unity 6 版本**——官方新版接口差异大，我们保持 2022.3 本地改，不随意升级。
+> ⚠️ 此仓库基于官方 `0.7.23` 适配 Unity 2022.3，不直接使用 Unity 6 原版；后续升级需继续维护 2022.3 兼容改动。
 
 ## 这是什么
 
 把 Unity 编辑器变成 HTTP + MCP 服务的桥插件：
 
 - 本地 HTTP 服务（**8765 优先，被占自动回退 9000**——桥内置机制，无需配置）；
-- 222+ 编辑器工具暴露给外部客户端（AI 助手 / 脚本 / 任何 HTTP 调用方）；
+- 275+ 编辑器工具暴露给外部客户端（AI 助手 / 脚本 / 任何 HTTP 调用方）；
 - 支持场景、UGUI、预制体、材质、光照、物理、动画、地形等全类目工具（工具实现位于 `Editor/Tools/`）。
 
 ## 安装（二选一）
@@ -59,7 +59,7 @@ foreach ($p in @(8765, 9000)) {
 
 - 只改本仓库（本地化版），不合并官方新版；
 - 改动后同步回项目 `Assets/Plugins/`（或反之，保持两处一致）；
-- 工具 222+ 全在 `Editor/Tools/Implementations/**`，加工具 = 加一个 ITool 实现并注册（`Editor/Tools/ToolRegistry.cs`）。
+- 工具 275+ 全在 `Editor/Tools/Implementations/**`，加工具 = 加一个 ITool 实现并注册（`Editor/Tools/ToolRegistry.cs`）。
 
 ## License
 
